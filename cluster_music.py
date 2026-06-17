@@ -6,6 +6,7 @@ Entrée par défaut : music_downloads/
 Sorties par défaut :
 - music_features.csv
 - music_clusters.csv
+- music_cluster_summary.csv
 - music_clusters.png
 
 Installation :
@@ -16,13 +17,16 @@ Exemples :
     py cluster_music.py --clusters 6
     py cluster_music.py --auto-k
     py cluster_music.py --input-dir music_downloads --annotate
+    py cluster_music.py --ffmpeg-path "C:\\chemin\\vers\\ffmpeg.exe"
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
-import math
+import shutil
+import subprocess
+import tempfile
 from pathlib import Path
 
 import librosa
@@ -71,19 +75,132 @@ def safe_float(value) -> float:
         return float("nan")
 
 
-def extract_features(audio_path: Path, sample_seconds: float, sr: int) -> dict:
+def find_ffmpeg(ffmpeg_path: str | None = None) -> str | None:
+    """Trouve ffmpeg, y compris dans quelques chemins Windows courants."""
+    if ffmpeg_path:
+        explicit = Path(ffmpeg_path)
+        if explicit.exists():
+            return str(explicit)
+        found = shutil.which(ffmpeg_path)
+        if found:
+            return found
+        return None
+
+    found = shutil.which("ffmpeg")
+    if found:
+        return found
+
+    candidates = []
+
+    local_app_data = Path.home() / "AppData" / "Local"
+    winget_packages = local_app_data / "Microsoft" / "WinGet" / "Packages"
+    if winget_packages.exists():
+        candidates.extend(winget_packages.glob("Gyan.FFmpeg*/*/bin/ffmpeg.exe"))
+        candidates.extend(winget_packages.glob("Gyan.FFmpeg*/ffmpeg*/bin/ffmpeg.exe"))
+        candidates.extend(winget_packages.glob("Gyan.FFmpeg*/bin/ffmpeg.exe"))
+
+    candidates.extend(Path("C:/ffmpeg/bin").glob("ffmpeg.exe"))
+    candidates.extend(Path("C:/Program Files").glob("**/ffmpeg.exe"))
+
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+
+    return None
+
+
+def convert_with_ffmpeg(
+    audio_path: Path,
+    *,
+    ffmpeg_bin: str,
+    sample_seconds: float,
+    sr: int,
+    temp_dir: Path,
+) -> Path:
+    """Convertit un fichier audio en WAV temporaire lisible par librosa."""
+    wav_path = temp_dir / f"{audio_path.stem}.wav"
+
+    cmd = [
+        ffmpeg_bin,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+    ]
+
+    if sample_seconds > 0:
+        cmd.extend(["-t", str(sample_seconds)])
+
+    cmd.extend(
+        [
+            "-i",
+            str(audio_path),
+            "-ac",
+            "1",
+            "-ar",
+            str(sr),
+            str(wav_path),
+        ]
+    )
+
+    result = subprocess.run(
+        cmd,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    if result.returncode != 0 or not wav_path.exists():
+        message = (result.stderr or result.stdout or "erreur ffmpeg inconnue").strip()
+        raise RuntimeError(f"ffmpeg n'a pas pu convertir le fichier : {message}")
+
+    return wav_path
+
+
+def load_audio(audio_path: Path, sample_seconds: float, sr: int, ffmpeg_bin: str | None) -> tuple[np.ndarray, int]:
+    """
+    Charge un fichier audio.
+
+    Stratégie :
+    1. essai direct avec librosa ;
+    2. si échec, conversion WAV temporaire via ffmpeg ;
+    3. chargement du WAV par librosa.
+    """
+    try:
+        return librosa.load(
+            str(audio_path),
+            sr=sr,
+            mono=True,
+            duration=sample_seconds if sample_seconds > 0 else None,
+        )
+    except Exception as first_error:
+        if not ffmpeg_bin:
+            raise RuntimeError(
+                "librosa n'a pas pu lire ce fichier et ffmpeg est introuvable. "
+                "Ferme/réouvre le terminal après l'installation de ffmpeg, ou passe --ffmpeg-path. "
+                f"Erreur initiale : {type(first_error).__name__}: {first_error!r}"
+            ) from first_error
+
+        with tempfile.TemporaryDirectory(prefix="musicstats_audio_") as tmp:
+            temp_dir = Path(tmp)
+            wav_path = convert_with_ffmpeg(
+                audio_path,
+                ffmpeg_bin=ffmpeg_bin,
+                sample_seconds=sample_seconds,
+                sr=sr,
+                temp_dir=temp_dir,
+            )
+            return librosa.load(str(wav_path), sr=sr, mono=True)
+
+
+def extract_features(audio_path: Path, sample_seconds: float, sr: int, ffmpeg_bin: str | None) -> dict:
     """
     Extrait un petit jeu de features robustes.
 
     On charge seulement les N premières secondes pour garder un script rapide.
     Les features sont volontairement simples : tempo, énergie, spectre, chroma, MFCC.
     """
-    y, sr = librosa.load(
-        str(audio_path),
-        sr=sr,
-        mono=True,
-        duration=sample_seconds if sample_seconds > 0 else None,
-    )
+    y, sr = load_audio(audio_path, sample_seconds=sample_seconds, sr=sr, ffmpeg_bin=ffmpeg_bin)
 
     if y.size == 0:
         raise ValueError("audio vide ou illisible")
@@ -309,6 +426,11 @@ def main() -> int:
         action="store_true",
         help="Affiche les noms des morceaux sur le graphe. Lisible surtout avec peu de titres.",
     )
+    parser.add_argument(
+        "--ffmpeg-path",
+        default=None,
+        help="Chemin optionnel vers ffmpeg.exe si le terminal ne trouve pas encore ffmpeg.",
+    )
 
     args = parser.parse_args()
 
@@ -317,6 +439,15 @@ def main() -> int:
         raise FileNotFoundError(
             f"Aucun fichier audio trouvé dans {args.input_dir}. "
             "Lance d'abord download_music.py sans --dry-run."
+        )
+
+    ffmpeg_bin = find_ffmpeg(args.ffmpeg_path)
+    if ffmpeg_bin:
+        print(f"ffmpeg détecté : {ffmpeg_bin}")
+    else:
+        print(
+            "ffmpeg non détecté. Le script essaiera la lecture directe avec librosa. "
+            "Pour les .webm, ferme/réouvre PowerShell ou passe --ffmpeg-path."
         )
 
     print(f"{len(audio_files)} fichiers audio trouvés dans {args.input_dir}")
@@ -332,13 +463,24 @@ def main() -> int:
                     audio_path=audio_path,
                     sample_seconds=args.sample_seconds,
                     sr=args.sr,
+                    ffmpeg_bin=ffmpeg_bin,
                 )
             )
         except Exception as exc:
-            print(f"  Erreur : {audio_path.name} | {exc}")
-            errors.append({"file": str(audio_path), "error": str(exc)})
+            error_message = f"{type(exc).__name__}: {exc!r}"
+            print(f"  Erreur : {audio_path.name} | {error_message}")
+            errors.append({"file": str(audio_path), "error": error_message})
+
+    errors_csv = Path(f"{args.output_prefix}_feature_errors.csv")
 
     if not features:
+        if errors:
+            pd.DataFrame(errors).to_csv(errors_csv, index=False, encoding="utf-8-sig")
+            raise RuntimeError(
+                "Aucun fichier audio n'a pu être analysé. "
+                f"Détails enregistrés dans : {errors_csv}. "
+                "Ferme/réouvre PowerShell après l'installation de ffmpeg, puis relance."
+            )
         raise RuntimeError("Aucun fichier audio n'a pu être analysé.")
 
     features_df = pd.DataFrame(features)
@@ -347,7 +489,6 @@ def main() -> int:
     clusters_csv = Path(f"{args.output_prefix}_clusters.csv")
     summary_csv = Path(f"{args.output_prefix}_cluster_summary.csv")
     graph_png = Path(f"{args.output_prefix}_clusters.png")
-    errors_csv = Path(f"{args.output_prefix}_feature_errors.csv")
 
     features_df.to_csv(features_csv, index=False, encoding="utf-8-sig")
 
