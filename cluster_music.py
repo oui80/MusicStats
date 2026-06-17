@@ -14,8 +14,8 @@ Installation :
 
 Exemples :
     py cluster_music.py
-    py cluster_music.py --clusters 6
-    py cluster_music.py --auto-k
+    py cluster_music.py --clusters 3
+    py cluster_music.py --auto-k --max-k 5
     py cluster_music.py --input-dir music_downloads --annotate
     py cluster_music.py --ffmpeg-path "C:\\chemin\\vers\\ffmpeg.exe"
 """
@@ -113,6 +113,7 @@ def convert_with_ffmpeg(
     audio_path: Path,
     *,
     ffmpeg_bin: str,
+    offset_seconds: float,
     sample_seconds: float,
     sr: int,
     temp_dir: Path,
@@ -127,6 +128,9 @@ def convert_with_ffmpeg(
         "error",
         "-y",
     ]
+
+    if offset_seconds > 0:
+        cmd.extend(["-ss", str(offset_seconds)])
 
     if sample_seconds > 0:
         cmd.extend(["-t", str(sample_seconds)])
@@ -157,7 +161,14 @@ def convert_with_ffmpeg(
     return wav_path
 
 
-def load_audio(audio_path: Path, sample_seconds: float, sr: int, ffmpeg_bin: str | None) -> tuple[np.ndarray, int]:
+def load_audio(
+    audio_path: Path,
+    *,
+    offset_seconds: float,
+    sample_seconds: float,
+    sr: int,
+    ffmpeg_bin: str | None,
+) -> tuple[np.ndarray, int]:
     """
     Charge un fichier audio.
 
@@ -171,6 +182,7 @@ def load_audio(audio_path: Path, sample_seconds: float, sr: int, ffmpeg_bin: str
             str(audio_path),
             sr=sr,
             mono=True,
+            offset=offset_seconds if offset_seconds > 0 else 0.0,
             duration=sample_seconds if sample_seconds > 0 else None,
         )
     except Exception as first_error:
@@ -186,6 +198,7 @@ def load_audio(audio_path: Path, sample_seconds: float, sr: int, ffmpeg_bin: str
             wav_path = convert_with_ffmpeg(
                 audio_path,
                 ffmpeg_bin=ffmpeg_bin,
+                offset_seconds=offset_seconds,
                 sample_seconds=sample_seconds,
                 sr=sr,
                 temp_dir=temp_dir,
@@ -193,14 +206,36 @@ def load_audio(audio_path: Path, sample_seconds: float, sr: int, ffmpeg_bin: str
             return librosa.load(str(wav_path), sr=sr, mono=True)
 
 
-def extract_features(audio_path: Path, sample_seconds: float, sr: int, ffmpeg_bin: str | None) -> dict:
-    """
-    Extrait un petit jeu de features robustes.
+def spectral_entropy(y: np.ndarray) -> float:
+    """Approximation simple de l'entropie spectrale."""
+    spectrum = np.abs(librosa.stft(y)) ** 2
+    power = spectrum / (np.sum(spectrum, axis=0, keepdims=True) + 1e-12)
+    entropy = -np.sum(power * np.log2(power + 1e-12), axis=0)
+    entropy = entropy / np.log2(power.shape[0])
+    return safe_float(np.mean(entropy))
 
-    On charge seulement les N premières secondes pour garder un script rapide.
-    Les features sont volontairement simples : tempo, énergie, spectre, chroma, MFCC.
+
+def extract_features(
+    audio_path: Path,
+    *,
+    offset_seconds: float,
+    sample_seconds: float,
+    sr: int,
+    ffmpeg_bin: str | None,
+) -> dict:
     """
-    y, sr = load_audio(audio_path, sample_seconds=sample_seconds, sr=sr, ffmpeg_bin=ffmpeg_bin)
+    Extrait des features audio simples.
+
+    Ce n'est pas une détection de genre. Les groupes représentent plutôt :
+    énergie, tempo, brillance, texture, percussion et couleur harmonique.
+    """
+    y, sr = load_audio(
+        audio_path,
+        offset_seconds=offset_seconds,
+        sample_seconds=sample_seconds,
+        sr=sr,
+        ffmpeg_bin=ffmpeg_bin,
+    )
 
     if y.size == 0:
         raise ValueError("audio vide ou illisible")
@@ -216,6 +251,14 @@ def extract_features(audio_path: Path, sample_seconds: float, sr: int, ffmpeg_bi
     flatness = librosa.feature.spectral_flatness(y=y)
     chroma = librosa.feature.chroma_stft(y=y, sr=sr)
     mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13)
+    onset = librosa.onset.onset_strength(y=y, sr=sr)
+
+    harmonic, percussive = librosa.effects.hpss(y)
+    harmonic_rms = librosa.feature.rms(y=harmonic)
+    percussive_rms = librosa.feature.rms(y=percussive)
+    total_rms_mean = float(np.mean(rms)) + 1e-12
+    percussive_ratio = float(np.mean(percussive_rms)) / total_rms_mean
+    harmonic_ratio = float(np.mean(harmonic_rms)) / total_rms_mean
 
     features = {
         "file": str(audio_path),
@@ -234,8 +277,13 @@ def extract_features(audio_path: Path, sample_seconds: float, sr: int, ffmpeg_bi
         "spectral_rolloff_std": safe_float(np.std(rolloff)),
         "spectral_flatness_mean": safe_float(np.mean(flatness)),
         "spectral_flatness_std": safe_float(np.std(flatness)),
+        "spectral_entropy_mean": spectral_entropy(y),
         "chroma_mean": safe_float(np.mean(chroma)),
         "chroma_std": safe_float(np.std(chroma)),
+        "onset_strength_mean": safe_float(np.mean(onset)),
+        "onset_strength_std": safe_float(np.std(onset)),
+        "percussive_ratio": safe_float(percussive_ratio),
+        "harmonic_ratio": safe_float(harmonic_ratio),
     }
 
     for i in range(mfcc.shape[0]):
@@ -294,6 +342,12 @@ def cluster_features(df: pd.DataFrame, clusters: int, auto_k: bool, max_k: int) 
     else:
         k = max(1, min(clusters, len(df)))
 
+    if len(df) < 40 and k > 3:
+        print(
+            f"Attention : {len(df)} titres seulement avec {k} clusters. "
+            "Les groupes risquent d'être instables. Essaie --clusters 3 ou télécharge plus de titres."
+        )
+
     if k == 1:
         labels = np.zeros(len(df), dtype=int)
     else:
@@ -345,6 +399,44 @@ def plot_clusters(df: pd.DataFrame, output_png: Path, annotate: bool) -> None:
     plt.close()
 
 
+def describe_cluster(group: pd.DataFrame) -> str:
+    """Produit un label approximatif, basé uniquement sur les moyennes audio."""
+    tempo = group["tempo_bpm"].mean()
+    energy = group["rms_mean"].mean()
+    brightness = group["spectral_centroid_mean"].mean()
+    percussive = group.get("percussive_ratio", pd.Series([0])).mean()
+
+    if tempo < 95:
+        speed = "lent"
+    elif tempo < 115:
+        speed = "tempo moyen"
+    else:
+        speed = "rapide"
+
+    if energy < 0.14:
+        energy_label = "doux"
+    elif energy < 0.20:
+        energy_label = "énergie moyenne"
+    else:
+        energy_label = "énergique"
+
+    if brightness < 1500:
+        brightness_label = "sombre/feutré"
+    elif brightness < 2200:
+        brightness_label = "équilibré"
+    else:
+        brightness_label = "brillant"
+
+    if percussive < 0.30:
+        rhythm_label = "peu percussif"
+    elif percussive < 0.55:
+        rhythm_label = "rythmique"
+    else:
+        rhythm_label = "très percussif"
+
+    return f"{speed}, {energy_label}, {brightness_label}, {rhythm_label}"
+
+
 def export_cluster_summary(df: pd.DataFrame, output_csv: Path) -> None:
     """Exporte un résumé lisible par cluster."""
     rows = []
@@ -354,9 +446,11 @@ def export_cluster_summary(df: pd.DataFrame, output_csv: Path) -> None:
             {
                 "cluster": int(cluster_id),
                 "count": len(group),
+                "label_auto": describe_cluster(group),
                 "avg_tempo_bpm": round(group["tempo_bpm"].mean(), 1),
                 "avg_rms": round(group["rms_mean"].mean(), 4),
                 "avg_spectral_centroid": round(group["spectral_centroid_mean"].mean(), 1),
+                "avg_percussive_ratio": round(group.get("percussive_ratio", pd.Series([0])).mean(), 3),
                 "examples": " | ".join(group["name"].head(8).tolist()),
             }
         )
@@ -367,9 +461,11 @@ def export_cluster_summary(df: pd.DataFrame, output_csv: Path) -> None:
             fieldnames=[
                 "cluster",
                 "count",
+                "label_auto",
                 "avg_tempo_bpm",
                 "avg_rms",
                 "avg_spectral_centroid",
+                "avg_percussive_ratio",
                 "examples",
             ],
         )
@@ -395,8 +491,8 @@ def main() -> int:
     parser.add_argument(
         "--clusters",
         type=int,
-        default=5,
-        help="Nombre de clusters KMeans.",
+        default=3,
+        help="Nombre de clusters KMeans. Défaut volontairement bas pour rester lisible avec peu de titres.",
     )
     parser.add_argument(
         "--auto-k",
@@ -406,14 +502,20 @@ def main() -> int:
     parser.add_argument(
         "--max-k",
         type=int,
-        default=10,
+        default=6,
         help="Nombre maximal de clusters testé avec --auto-k.",
+    )
+    parser.add_argument(
+        "--offset-seconds",
+        type=float,
+        default=30.0,
+        help="Début de l'analyse après N secondes pour éviter les intros. 0 = début du titre.",
     )
     parser.add_argument(
         "--sample-seconds",
         type=float,
-        default=90.0,
-        help="Nombre de secondes analysées par titre. 0 = titre complet.",
+        default=120.0,
+        help="Nombre de secondes analysées après l'offset. 0 = jusqu'à la fin.",
     )
     parser.add_argument(
         "--sr",
@@ -451,6 +553,7 @@ def main() -> int:
         )
 
     print(f"{len(audio_files)} fichiers audio trouvés dans {args.input_dir}")
+    print(f"Analyse : offset={args.offset_seconds}s | durée={args.sample_seconds}s | clusters={args.clusters}")
 
     features = []
     errors = []
@@ -461,6 +564,7 @@ def main() -> int:
             features.append(
                 extract_features(
                     audio_path=audio_path,
+                    offset_seconds=args.offset_seconds,
                     sample_seconds=args.sample_seconds,
                     sr=args.sr,
                     ffmpeg_bin=ffmpeg_bin,
